@@ -92,12 +92,16 @@ def _get_converter(ckpt_dir, log=print):
 def convert_to_adam(src_wav, ref_wav, out_wav, ckpt_dir, log=print, src_voice_id='base_vi'):
     from openvoice import se_extractor
     conv = _get_converter(ckpt_dir, log)
+    # NOTE: vad=False -> split_audio_whisper (faster-whisper, already bundled).
+    # vad=True would call whisper_timestamped.get_vad_segments(method="silero"),
+    # which uses torch.hub to download snakers4/silero-vad from GitHub and asks
+    # for trust via input() -> crashes in the frozen windowed app (no stdin).
     if ref_wav not in _ref_se_cache:
-        _ref_se_cache[ref_wav] = se_extractor.get_se(ref_wav, conv, vad=True)[0]
+        _ref_se_cache[ref_wav] = se_extractor.get_se(ref_wav, conv, vad=False)[0]
     # Base TTS voice is the same for every segment -> extract its embedding once.
     skey = (ckpt_dir, src_voice_id)
     if skey not in _src_se_cache:
-        _src_se_cache[skey] = se_extractor.get_se(src_wav, conv, vad=True)[0]
+        _src_se_cache[skey] = se_extractor.get_se(src_wav, conv, vad=False)[0]
     src_se = _src_se_cache[skey]
     tgt_se = _ref_se_cache[ref_wav]
     conv.convert(audio_src_path=src_wav, src_se=src_se, tgt_se=tgt_se,
