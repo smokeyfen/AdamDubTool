@@ -46,7 +46,7 @@ def _whisper_model_path():
     local = os.path.normpath(local)
     return local if os.path.isdir(local) else 'base'
 
-def transcribe(wav_path, log=print):
+def transcribe(wav_path, log=print, initial_prompt=None):
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
@@ -55,7 +55,8 @@ def transcribe(wav_path, log=print):
         _whisper_model = WhisperModel(mp, device='cpu', compute_type='int8')
     log('Đang nghe và tách lời thoại...')
     segments, _ = _whisper_model.transcribe(wav_path, language='vi', vad_filter=True,
-                                             vad_parameters=dict(min_silence_duration_ms=400))
+                                             vad_parameters=dict(min_silence_duration_ms=400),
+                                             initial_prompt=initial_prompt)
     out = [{'start': s.start, 'end': s.end, 'text': s.text.strip()}
            for s in segments if s.text.strip()]
     log(f'Đã tách {len(out)} câu thoại.')
@@ -96,14 +97,21 @@ def convert_to_adam(src_wav, ref_wav, out_wav, ckpt_dir, log=print, src_voice_id
     # vad=True would call whisper_timestamped.get_vad_segments(method="silero"),
     # which uses torch.hub to download snakers4/silero-vad from GitHub and asks
     # for trust via input() -> crashes in the frozen windowed app (no stdin).
-    if ref_wav not in _ref_se_cache:
-        _ref_se_cache[ref_wav] = se_extractor.get_se(ref_wav, conv, vad=False)[0]
+    # ref_wav may be a single path or a list of paths (embeddings averaged).
+    refs = list(ref_wav) if isinstance(ref_wav, (list, tuple)) else [ref_wav]
+    rkey = tuple(refs)
+    if rkey not in _ref_se_cache:
+        import torch
+        ses = [se_extractor.get_se(r, conv, vad=False)[0] for r in refs]
+        _ref_se_cache[rkey] = torch.stack(ses).mean(dim=0) if len(ses) > 1 else ses[0]
+        if len(ses) > 1:
+            log(f'Đã gộp {len(ses)} mẫu giọng Adam làm giọng chuẩn.')
     # Base TTS voice is the same for every segment -> extract its embedding once.
     skey = (ckpt_dir, src_voice_id)
     if skey not in _src_se_cache:
         _src_se_cache[skey] = se_extractor.get_se(src_wav, conv, vad=False)[0]
     src_se = _src_se_cache[skey]
-    tgt_se = _ref_se_cache[ref_wav]
+    tgt_se = _ref_se_cache[rkey]
     conv.convert(audio_src_path=src_wav, src_se=src_se, tgt_se=tgt_se,
                  output_path=out_wav, message='@MyShell')
 
