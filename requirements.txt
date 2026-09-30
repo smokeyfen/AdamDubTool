@@ -1,0 +1,26 @@
+# AdamDubTool dependencies (Python 3.10)
+torch
+numpy
+scipy
+scikit-learn
+librosa
+soundfile
+pydub
+audiotsm
+faster-whisper
+ctranslate2
+onnxruntime
+tokenizers
+whisper-timestamped
+openai-whisper
+edge-tts
+jieba
+pypinyin
+cn2an
+eng-to-ipa
+unidecode
+inflect
+av
+aiohttp
+certifi
+# openvoice: dùng bản local trong build/openvoice_pkg (myshell-ai/OpenVoice)
