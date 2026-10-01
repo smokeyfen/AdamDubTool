@@ -1,26 +1,11 @@
-"""Adam AI Dubbing - core pipeline (CPU, free, offline after first run)."""
-import os, subprocess, shutil, sys, wave
+"""Adam AI Dubbing v7 - core pipeline (CPU, free, offline).
+
+Whisper large-v3-turbo -> auto emotion tagging -> VieNeu-TTS v3 Turbo
+(direct Adam voice cloning) -> warm voice post-processing -> FFmpeg.
+No manual transcript review: emotion tags are added automatically.
+"""
+import os, subprocess, sys, wave
 import numpy as np
-
-# Make the bundled OpenVoice sources importable (dev layout and PyInstaller bundle).
-_here = os.path.dirname(os.path.abspath(__file__))
-for _cand in (os.path.join(_here, '..', 'openvoice_src'),
-              os.path.join(getattr(sys, '_MEIPASS', _here), 'openvoice_src')):
-    _cand = os.path.normpath(_cand)
-    if os.path.isdir(_cand) and _cand not in sys.path:
-        sys.path.insert(0, _cand)
-
-# Compat: PyAV>=15 removed av.open(metadata_errors=...) which faster-whisper passes.
-# Drop the kwarg so any av version works.
-try:
-    import av as _av
-    _orig_av_open = _av.open
-    def _av_open_compat(*a, **k):
-        k.pop('metadata_errors', None)
-        return _orig_av_open(*a, **k)
-    _av.open = _av_open_compat
-except ImportError:
-    pass
 
 # ---------- audio helpers ----------
 def run(cmd):
@@ -36,24 +21,48 @@ def ensure_wav_16k_mono(src, dst):
 def extract_audio(video_path, out_wav):
     ensure_wav_16k_mono(video_path, out_wav)
 
-# ---------- 1. transcribe ----------
+# ---------- 1. transcribe (faster-whisper large-v3-turbo) ----------
 _whisper_model = None
-def _whisper_model_path():
-    env = os.environ.get('OPENVOICE_WHISPER_MODEL')
-    if env:
-        return env
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'faster-whisper-base')
-    local = os.path.normpath(local)
-    return local if os.path.isdir(local) else 'base'
+def _models_dir(*parts):
+    """Locate the bundled models dir in frozen (ROOT/models) or dev (ROOT/build/models) layout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    frozen_root = getattr(sys, '_MEIPASS', None)
+    dev_root = os.path.normpath(os.path.join(here, '..'))
+    for root in ([frozen_root] if frozen_root else []) + [dev_root]:
+        for base in ('models', os.path.join('build', 'models')):
+            cand = os.path.join(root, base, *parts)
+            if os.path.isdir(cand):
+                return cand
+    # Fallback: frozen layout path (the app sets env vars to this).
+    return os.path.join(frozen_root or dev_root, 'models', *parts)
+
+def _whisper_model_select():
+    """Return (dir, label). Prefer large-v3-turbo if fully present, else base.
+
+    large-v3-turbo (~1.5GB) is the accurate model; base is the offline fallback.
+    A directory only counts if model.bin actually exists (partial downloads
+    must never be used).
+    """
+    for name, label in (('faster-whisper-large-v3-turbo', 'large-v3-turbo'),
+                        ('faster-whisper-base', 'base')):
+        d = _models_dir(name)
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, 'model.bin')):
+            return d, label
+    return None, None
 
 def transcribe(wav_path, log=print, initial_prompt=None):
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        mp = _whisper_model_path()
-        log(f'Đang tải model Whisper ({mp})...')
+        mp = os.environ.get('ADAM_WHISPER_MODEL')
+        label = 'large-v3-turbo'
+        if not (mp and os.path.exists(os.path.join(mp, 'model.bin'))):
+            mp, label = _whisper_model_select()
+        if not mp:
+            mp, label = 'large-v3-turbo', 'large-v3-turbo'  # last resort: download on first run
+        log(f'Đang tải model Whisper {label} ({mp})...')
         _whisper_model = WhisperModel(mp, device='cpu', compute_type='int8')
-    log('Đang nghe và tách lời thoại...')
+    log('Đang nghe và tách lời thoại (large-v3-turbo)...')
     segments, _ = _whisper_model.transcribe(wav_path, language='vi', vad_filter=True,
                                              vad_parameters=dict(min_silence_duration_ms=400),
                                              initial_prompt=initial_prompt)
@@ -62,60 +71,62 @@ def transcribe(wav_path, log=print, initial_prompt=None):
     log(f'Đã tách {len(out)} câu thoại.')
     return out
 
-# ---------- 2. vietnamese base TTS ----------
-def synth_vi(text, out_mp3, voice='vi-VN-NamMinhNeural', log=print):
-    import asyncio, edge_tts
-    proxy = (os.environ.get('EDGE_TTS_PROXY') or os.environ.get('HTTPS_PROXY')
-             or os.environ.get('https_proxy'))
-    async def _go():
-        await edge_tts.Communicate(text, voice, proxy=proxy).save(out_mp3)
+# ---------- 2. Adam voice via VieNeu-TTS v3 Turbo (direct cloning) ----------
+_tts = None
+def _vieneu_root():
+    vroot = _models_dir('vieneu')
+    if not os.path.isdir(vroot):
+        raise RuntimeError('Không tìm thấy thư mục models/vieneu trong gói cài đặt.')
+    return vroot
+
+def get_tts(log=print):
+    """Lazy singleton. Offline: all model files are bundled locally."""
+    global _tts
+    if _tts is None:
+        from vieneu import Vieneu
+        from vieneu._v3_turbo_engine import onnx_runtime_lite as _O
+        vroot = _vieneu_root()
+        # The codec artifacts live in the bundled dir; keep HF out of the loop.
+        _orig_fetch = _O.OnnxV3LiteEngine._fetch
+        def _local_fetch(repo, files, subfolder=None):
+            if 'MOSS' in str(repo):
+                # Must be a pathlib.Path: the engine does `cd / "file.onnx"`.
+                from pathlib import Path as _P
+                return _P(os.path.join(vroot, 'codec'))
+            return _orig_fetch(repo, files, subfolder)
+        _O.OnnxV3LiteEngine._fetch = staticmethod(_local_fetch)
+        try:
+            log('Đang tải model giọng nói VieNeu v3 Turbo (lần đầu hơi lâu)...')
+            _tts = Vieneu(backend='onnx', checkpoint_path=vroot,
+                          onnx_dir=os.path.join(vroot, 'onnx_update'))
+        finally:
+            _O.OnnxV3LiteEngine._fetch = _orig_fetch
+    return _tts
+
+def enroll_adam(ref_wav, log=print):
+    """Register the Adam reference voice once per run. Returns the voice name."""
+    tts = get_tts(log)
+    if 'Adam' not in tts._preset_voices:
+        log('Đang đăng ký giọng mẫu Adam (lấy 8s đầu, khử nhiễu)...')
+        tts.add_voice('Adam', ref_wav, denoise=True)
+        log('Đã đăng ký giọng Adam.')
+    return 'Adam'
+
+def synth_adam(text, out_wav_16k, log=print):
+    """Direct text -> Adam voice (48kHz) -> 16k mono wav for the dub track."""
+    tts = get_tts(log)
+    wav48 = tts.infer(text, voice='Adam', apply_watermark=False)
+    if wav48 is None or len(wav48) == 0:
+        raise RuntimeError(f'Không tạo được audio cho câu: "{text[:60]}"')
+    tmp48 = out_wav_16k + '.48k.wav'
+    tts.save(wav48, tmp48)
     try:
-        asyncio.run(_go())
-    except Exception as e:
-        raise RuntimeError(
-            'Không tạo được giọng đọc (cần mạng Internet để gọi Edge-TTS). '
-            f'Hãy kiểm tra mạng rồi thử lại. Chi tiết: {e}')
+        ensure_wav_16k_mono(tmp48, out_wav_16k)
+    finally:
+        try: os.remove(tmp48)
+        except OSError: pass
 
-# ---------- 3. tone conversion to Adam ----------
-_converter = None
-_ref_se_cache = {}
-_src_se_cache = {}
-def _get_converter(ckpt_dir, log=print):
-    global _converter
-    if _converter is None:
-        from openvoice.api import ToneColorConverter
-        log('Đang tải model chuyển giọng OpenVoice (lần đầu hơi lâu)...')
-        _converter = ToneColorConverter(f'{ckpt_dir}/converter/config.json', device='cpu',
-                                          enable_watermark=False)
-        _converter.load_ckpt(f'{ckpt_dir}/converter/checkpoint.pth')
-    return _converter
-
-def convert_to_adam(src_wav, ref_wav, out_wav, ckpt_dir, log=print, src_voice_id='base_vi'):
-    from openvoice import se_extractor
-    conv = _get_converter(ckpt_dir, log)
-    # NOTE: vad=False -> split_audio_whisper (faster-whisper, already bundled).
-    # vad=True would call whisper_timestamped.get_vad_segments(method="silero"),
-    # which uses torch.hub to download snakers4/silero-vad from GitHub and asks
-    # for trust via input() -> crashes in the frozen windowed app (no stdin).
-    # ref_wav may be a single path or a list of paths (embeddings averaged).
-    refs = list(ref_wav) if isinstance(ref_wav, (list, tuple)) else [ref_wav]
-    rkey = tuple(refs)
-    if rkey not in _ref_se_cache:
-        import torch
-        ses = [se_extractor.get_se(r, conv, vad=False)[0] for r in refs]
-        _ref_se_cache[rkey] = torch.stack(ses).mean(dim=0) if len(ses) > 1 else ses[0]
-        if len(ses) > 1:
-            log(f'Đã gộp {len(ses)} mẫu giọng Adam làm giọng chuẩn.')
-    # Base TTS voice is the same for every segment -> extract its embedding once.
-    skey = (ckpt_dir, src_voice_id)
-    if skey not in _src_se_cache:
-        _src_se_cache[skey] = se_extractor.get_se(src_wav, conv, vad=False)[0]
-    src_se = _src_se_cache[skey]
-    tgt_se = _ref_se_cache[rkey]
-    conv.convert(audio_src_path=src_wav, src_se=src_se, tgt_se=tgt_se,
-                 output_path=out_wav, message='@MyShell')
-
-# ---------- 4. fit to original timing ----------
+# ---------- 3. fit to original timing ----------
 def fit_duration(wav_path, target_dur, log=print):
     """Time-stretch so the clip fits the original slot. Returns possibly new path."""
     from audiotsm import wsola
@@ -123,7 +134,6 @@ def fit_duration(wav_path, target_dur, log=print):
     dur = wav_duration(wav_path)
     if dur <= 0 or target_dur <= 0:
         return wav_path
-    ratio = target_dur / dur  # >1 means need slower/longer
     speed = dur / target_dur  # wsola speed: >1 = faster
     if 0.85 <= speed <= 1.18:
         out = wav_path.replace('.wav', '_fit.wav')
@@ -149,7 +159,7 @@ def build_track(clips, total_dur, out_wav, sr=16000, log=print):
         w.writeframes((track * 32767).astype(np.int16).tobytes())
     log(f'Đã dựng track lồng tiếng: {wav_duration(out_wav):.1f}s')
 
-# ---------- 5. mux ----------
+# ---------- 4. mux ----------
 def _has_audio_stream(video_path):
     try:
         out = subprocess.run(['ffmpeg', '-hide_banner', '-i', video_path],
